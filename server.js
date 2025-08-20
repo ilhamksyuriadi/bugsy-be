@@ -8,6 +8,7 @@ const app = express();
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
+const RAG_API_BASE_URL = process.env.RAG_API_BASE_URL || 'http://localhost:8000'; 
 
 // function verifySignature(req, secret) {
 //   const signature = req.headers['x-hub-signature-256'] || '';
@@ -49,13 +50,16 @@ app.post('/github-webhook', async (req, res) => {
 async function handlePullRequest(payload) {
   console.log(`Processing PR #${payload.number}`);
 
-  // Get the diff content
+  // 1. Get the diff content
   const diffContent = await getDiffContent(payload);
 
-  // Prepare the review prompt
-  const reviewPrompt = createReviewPrompt(diffContent, payload);
+  // 2. [NEW STEP] Get relevant context from your RAG API
+  const relevantContext = await getRelevantContextFromRAG(diffContent);
 
-  // Get review from DeepSeek API
+  // 3. Prepare the review prompt, now INCLUDING the retrieved context
+  const reviewPrompt = createReviewPrompt(diffContent, relevantContext, payload);
+
+  // 4. Get review from DeepSeek API
   const reviewComments = await getDeepSeekReview(reviewPrompt);
 
   return reviewComments;
@@ -67,37 +71,86 @@ async function getDiffContent(payload) {
   return diffResponse.data;
 }
 
-function createReviewPrompt(diffContent, payload) {
+// [NEW FUNCTION] This function calls your Python RAG API
+async function getRelevantContextFromRAG(diffText) {
+  console.log('Fetching relevant context from RAG API...');
+  try {
+    const response = await axios.post(
+      `${RAG_API_BASE_URL}/retrieve-context`, // Your RAG endpoint
+      {
+        diff_text: diffText,
+        k: 5 // Number of context chunks to retrieve. Adjust as needed.
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000 // 10 second timeout
+      }
+    );
+
+    console.log('✅ Successfully retrieved context from RAG API');
+    // Format the context into a nice string for the prompt
+    return formatRetrievedContext(response.data.retrieved_context);
+  } catch (error) {
+    console.error('❌ RAG API error:', error.message);
+    // It's crucial to handle this error gracefully.
+    // If the RAG API is down, we can still proceed with a basic review.
+    return "**Warning:** Could not retrieve relevant context from the codebase. Review is based on general best practices only.\n";
+  }
+}
+
+function formatRetrievedContext(contextArray) {
+  if (!contextArray || contextArray.length === 0) {
+    return "No relevant context was found in the codebase for these changes.\n";
+  }
+
+  let contextString = "## RELEVANT CONTEXT FROM THE CODEBASE:\n";
+  contextString += "Here are snippets from the existing codebase that are related to this change:\n\n";
+
+  contextArray.forEach((chunk, index) => {
+    contextString += `### Context Snippet ${index + 1} (From: ${chunk.file_path})\n`;
+    contextString += '```\n';
+    contextString += chunk.content + '\n';
+    contextString += '```\n\n';
+  });
+
+  return contextString;
+}
+
+function createReviewPrompt(diffContent, relevantContext, payload) {
   return `
     Please review these code changes for pull request #${payload.number}:
     Title: ${payload.pull_request.title}
     Description: ${payload.pull_request.body || 'No description provided'}
 
-    Code changes:
+    ${relevantContext}
+
+    Code changes (DIFF):
     ${diffContent}
 
     Review requirements:
-    1. Analyze for code quality issues
-    2. Check for potential bugs
-    3. Identify security concerns
-    4. Suggest improvements, optimizations, modern practices and best practices
-    5. Format response in markdown with clear sections
-    6. Keep comments actionable and specific
+    1. Analyze for code quality issues, consistency with the existing codebase patterns shown above, and potential conflicts.
+    2. Check for potential bugs, paying special attention to how this change interacts with the related code shown in the context.
+    3. Identify security concerns based on the patterns in use.
+    4. Suggest improvements, optimizations, and best practices. If the context shows a established pattern, suggest following it. If it shows a bad pattern, suggest improving it in both this new code and the old one.
+    5. Format response in markdown with clear sections.
+    6. Keep comments actionable and specific. Reference the relevant context files if applicable.
 
-    make sure to give code example/solution for each point if applicable.
+    Make sure to give code example/solution for each point if applicable.
 
-    make sure the review format looks like this:
+    Make sure the review format looks like this:
     1. point 1
       [bullet list for sub points]
         [bullet list outlined for sub sub points]
     2. point 2
       [bullet list for sub points]
         [bullet list outlined for sub sub points]
-    ...countinue until all points are covered
+    ...continue until all points are covered
 
-    No need to ask back, just provide a thorough review based on the changes above.
-    Also please indentify room for improvement for the pr creator to learn and give learning suggestion/refferences under word "Room for Improvement:" don't put any markdown on this one.
-    Based on "Room for Improvement:" categorize in which level of each issue (basic, intermediate, advance) put it in point formart start with -, then give overall/averge category of all issue under of it, put it under section "Category:". don't put any markdown or font style on this one.
+    No need to ask back, just provide a thorough review based on the changes and the context above.
+    Also please identify room for improvement for the pr creator to learn and give learning suggestion/references under word "Room for Improvement:" don't put any markdown on this one.
+    Based on "Room for Improvement:" categorize in which level of each issue (basic, intermediate, advance) put it in point format start with -, then give overall/average category of all issue under of it, put it under section "Category:". don't put any markdown or font style on this one.
     `;
 }
 
