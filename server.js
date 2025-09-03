@@ -2,6 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const connectDB = require('./config/database');
+
+const SkillAnalysis = require('./models/skillAnalysis');
+const { parseAnalysisText } = require('./utils/analysisParser');
+const { mockResponseString } = require('./scripts/mockResponse');
 // const crypto = require('crypto');
 
 const app = express();
@@ -9,6 +14,8 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const RAG_API_BASE_URL = process.env.RAG_API_BASE_URL || 'http://localhost:8000'; 
+// Connect to MongoDB Atlas
+connectDB(); // This runs when your server starts
 
 // function verifySignature(req, secret) {
 //   const signature = req.headers['x-hub-signature-256'] || '';
@@ -31,9 +38,9 @@ app.post('/github-webhook', async (req, res) => {
   if (event === 'pull_request') {
     if (['opened', 'synchronize'].includes(payload.action)) {
       try {
-        const reviewComments = await handlePullRequest(payload);
-        console.log('Review comments generated:', reviewComments);
-        await postReviewComments(payload, reviewComments);
+        await handlePullRequest(payload);
+        // console.log('Review comments generated:', reviewComments);
+        // await postReviewComments(payload, reviewComments);
         res.status(200).send('PR review completed');
       } catch (error) {
         console.error('Error:', error);
@@ -47,22 +54,81 @@ app.post('/github-webhook', async (req, res) => {
   }
 });
 
+async function storeSkillAnalysis(payload, analysisText) {
+  try {
+    console.log('🔍 RAW ANALYSIS TEXT FROM LLM:');
+    console.log(analysisText); // This will show us what we're working with
+
+    const parsedAnalysis = parseAnalysisText(analysisText);
+    console.log('🔍 PARSED ANALYSIS:');
+    console.log(JSON.stringify(parsedAnalysis, null, 2));
+
+    const pr = payload.pull_request; // Shortcut for easier access
+    
+
+    // Create a new record with the enhanced data
+    const analysisRecord = new SkillAnalysis({
+      pr_id: payload.number,
+      repo: payload.repository.full_name,
+      author: pr.user.login,
+      timestamp: new Date(),
+      changes: {
+        diff_url: pr.diff_url,
+        file_count: pr.changed_files,    // ✅ Direct from payload
+        additions: pr.additions,         // ✅ Direct from payload  
+        deletions: pr.deletions,         // ✅ Direct from payload
+        total_changes: pr.additions + pr.deletions // ✅ Easy calculation
+        // removed changed_files: [] - no need for the list right now
+      },
+      analysis: parsedAnalysis
+    });
+
+    await analysisRecord.save();
+    console.log('✅ Skill analysis saved to DB');
+
+  } catch (error) {
+    console.error('❌ Failed to save skill analysis:', error);
+    // It's helpful to log the payload to debug if things are missing
+    console.error('Payload excerpt:', {
+      number: payload.number,
+      'pr.changed_files': payload.pull_request?.changed_files,
+      'pr.additions': payload.pull_request?.additions,
+      'pr.deletions': payload.pull_request?.deletions
+    });
+  }
+}
+
+
 async function handlePullRequest(payload) {
   console.log(`Processing PR #${payload.number}`);
 
   // 1. Get the diff content
   const diffContent = await getDiffContent(payload);
 
-  // 2. [NEW STEP] Get relevant context from your RAG API
+  // 2. Get relevant context from your RAG API
   const relevantContext = await getRelevantContextFromRAG(diffContent);
 
-  // 3. Prepare the review prompt, now INCLUDING the retrieved context
+  // 3. Prepare the review prompt
   const reviewPrompt = createReviewPrompt(diffContent, relevantContext, payload);
 
-  // 4. Get review from DeepSeek API
-  const reviewComments = await getDeepSeekReview(reviewPrompt);
+  // 4. Get review from DeepSeek API 
+  // const llmResponse = await getDeepSeekReview(reviewPrompt);
+  const llmResponse = mockResponseString
+  console.log('🔍 RAW LLM RESPONSE:', llmResponse);
 
-  return reviewComments;
+  // 5. Parse the response
+  const reviewSection = extractSection(llmResponse, '<REVIEW_START>', '</REVIEW_END>');
+  console.log('🔍 EXTRACTED REVIEW SECTION:', reviewSection);
+  const analysisSection = extractSection(llmResponse, '<ANALYSIS_START>', '</ANALYSIS_END>');
+  console.log('🔍 EXTRACTED ANALYSIS SECTION:', analysisSection);
+
+  // 6. Post the review and store analysis IN PARALLEL for better performance
+  await Promise.allSettled([
+    postReviewComments(payload, reviewSection),
+    storeSkillAnalysis(payload, analysisSection) // Pass diffContent here
+  ]);
+
+  // return reviewComments;
 }
 
 async function getDiffContent(payload) {
@@ -79,7 +145,7 @@ async function getRelevantContextFromRAG(diffText) {
       `${RAG_API_BASE_URL}/retrieve-context`, // Your RAG endpoint
       {
         diff_text: diffText,
-        k: 5 // Number of context chunks to retrieve. Adjust as needed.
+        k: 3 // Number of context chunks to retrieve. Adjust as needed.
       },
       {
         headers: {
@@ -98,6 +164,16 @@ async function getRelevantContextFromRAG(diffText) {
     // If the RAG API is down, we can still proceed with a basic review.
     return "**Warning:** Could not retrieve relevant context from the codebase. Review is based on general best practices only.\n";
   }
+}
+
+function extractSection(text, startMarker, endMarker) {
+  const startIndex = text.indexOf(startMarker) + startMarker.length;
+  const endIndex = text.indexOf(endMarker);
+  if (startIndex === -1 || endIndex === -1) {
+    console.warn("Could not find markers in LLM response. Using fallback.");
+    return text; // Fallback: return the whole text
+  }
+  return text.substring(startIndex, endIndex).trim();
 }
 
 function formatRetrievedContext(contextArray) {
@@ -120,37 +196,62 @@ function formatRetrievedContext(contextArray) {
 
 function createReviewPrompt(diffContent, relevantContext, payload) {
   return `
-    Please review these code changes for pull request #${payload.number}:
-    Title: ${payload.pull_request.title}
-    Description: ${payload.pull_request.body || 'No description provided'}
-
+    # ROLE & GOAL
+    You are an expert, meticulous, and constructive senior software engineer performing a code review for a colleague. Your goal is to improve the code quality and share knowledge, not just find faults.
+    
+    # CONTEXT FROM CODEBASE
+    <CONTEXT_START>
     ${relevantContext}
+    <CONTEXT_END>
 
-    Code changes (DIFF):
+    # PULL REQUEST DETAILS
+    **PR Title:** ${payload.pull_request.title}
+    **PR Description:** ${payload.pull_request.body || 'No description provided.'}
+    **PR Author:** ${payload.pull_request.user.login}
+
+    # CODE CHANGES (DIFF)
+    <DIFF_START>
     ${diffContent}
+    <DIFF_END>
 
-    Review requirements:
-    1. Analyze for code quality issues, consistency with the existing codebase patterns shown above, and potential conflicts.
-    2. Check for potential bugs, paying special attention to how this change interacts with the related code shown in the context.
-    3. Identify security concerns based on the patterns in use.
-    4. Suggest improvements, optimizations, and best practices. If the context shows a established pattern, suggest following it. If it shows a bad pattern, suggest improving it in both this new code and the old one.
-    5. Format response in markdown with clear sections.
-    6. Keep comments actionable and specific. Reference the relevant context files if applicable.
+    **Focus your analysis on:**
+    1.  **Correctness & Bugs:** Will this work as intended? Are there edge cases, race conditions, or logical errors?
+    2.  **Security:** Are there any obvious vulnerabilities (e.g., XSS, SQLi, insecure dependencies, authZ/authN flaws)?
+    3.  **Performance & Scalability:** Could this cause slow operations, memory leaks, or not scale well?
+    4.  **Consistency & Patterns:** Does this follow the patterns and conventions established in the provided context from our codebase? If it introduces a new pattern, is it justified and better?
+    5.  **Maintainability & Readability:** Is the code clear, well-documented, and easy to understand? Would a new team member struggle with this?
+    6.  **Design & Architecture:** Are the changes well-structured? Is there tight coupling, poor separation of concerns, or missed opportunities for abstraction?
 
-    Make sure to give code example/solution for each point if applicable.
+    # OUTPUT FORMATTING RULES - CRITICAL
+    You MUST format your response using the following exact structure and markers. Do not deviate.
 
-    Make sure the review format looks like this:
-    1. point 1
-      [bullet list for sub points]
-        [bullet list outlined for sub sub points]
-    2. point 2
-      [bullet list for sub points]
-        [bullet list outlined for sub sub points]
-    ...continue until all points are covered
+    <REVIEW_START>
+    ## 🧐 Comprehensive Code Review
+    [Provide your full, detailed review here using markdown. Structure it using the points above (Correctness, Security, etc.) as headings. Be specific, cite lines from the diff if possible, and offer concrete suggestions and code examples for fixes.]
+    </REVIEW_END>
 
-    No need to ask back, just provide a thorough review based on the changes and the context above.
-    Also please identify room for improvement for the pr creator to learn and give learning suggestion/references under word "Room for Improvement:" don't put any markdown on this one.
-    Based on "Room for Improvement:" categorize in which level of each issue (basic, intermediate, advance) put it in point format start with -, then give overall/average category of all issue under of it, put it under section "Category:". don't put any markdown or font style on this one.
+    <ANALYSIS_START>
+    ## Room for Improvement
+    For each significant issue found, categorize it and provide a concise learning suggestion. Focus on the most impactful issues.
+
+    CRITICAL FORMATTING RULES:
+    - Each issue MUST start with: - **[(Basic|Intermediate|Advanced)]** 
+    - The level MUST be one of those three exact words
+    - If you don't know the level, DON'T include the issue
+    - Invalid formatting will cause system errors
+
+    Examples:
+    - **[(Basic|Intermediate|Advanced)]** **Issue Description:** [One sentence describing the specific issue, e.g., "Using \`var\` instead of \`let\`/\`const\`."]
+      - **Suggestion:** [One sentence suggestion, e.g., "Learn about JavaScript scoping: MDN link on \`let\` and \`const\`."]
+    - **[(Basic|Intermediate|Advanced)]** **Inconsistent Naming:** [e.g., "Function name \`fetchData()\` doesn't follow the project's \`getResource\` pattern."]
+      - **Suggestion:** [e.g., "Review the project's naming conventions in \`CONTRIBUTING.md\`."]
+    - **[(Basic|Intermediate|Advanced)]** **Missing Error Handling:** [e.g., "The API call in \`newFeature.ts\` lacks a \`try/catch\` block."]
+      - **Suggestion:** [e.g., "Learn about asynchronous error handling patterns in our codebase. See how it's done in \`src/utils/api.ts\`."]
+
+    ## Category Summary
+    **Overall Level:** [Basic|Intermediate|Advanced]
+    *(A summary based on the highest frequency and severity of the issues found. e.g., "Intermediate - Mostly consistent with a few notable gaps in error handling.")*
+    </ANALYSIS_END>
     `;
 }
 
@@ -164,7 +265,7 @@ async function getDeepSeekReview(prompt) {
         messages: [
           {
             role: "system",
-            content: "You are an expert code reviewer. Provide thorough, professional analysis of these changes."
+            content: "You are an expert, meticulous, and constructive senior software engineer performing a code review for a colleague. Your goal is to improve the code quality and share knowledge, not just find faults."
           },
           {
             role: "user",
@@ -243,5 +344,5 @@ async function postReviewComments(payload, reviewComments) {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Webhook URL: https://6e485c501c2c.ngrok-free.app/github-webhook`);
+  console.log(`Webhook URL: https://7d02eea48689.ngrok-free.app/github-webhook`);
 });
